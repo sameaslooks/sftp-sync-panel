@@ -42,13 +42,15 @@ class ScanWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.progress.emit("Scanning local files…")
+            md5 = getattr(self.profile, "compare_mode", "mtime") == "md5"
+            suffix = " (MD5)…" if md5 else "…"
+            self.progress.emit(f"Scanning local files{suffix}")
             local: Dict[str, FileInfo] = scan_local(
-                self.profile.local_path, self.profile.exclusions
+                self.profile.local_path, self.profile.exclusions, compute_md5=md5
             )
-            self.progress.emit(f"Local: {len(local)} files. Scanning remote…")
+            self.progress.emit(f"Local: {len(local)} files. Scanning remote{suffix}")
             remote: Dict[str, FileInfo] = scan_remote(
-                self.conn, self.profile.remote_path, self.profile.exclusions
+                self.conn, self.profile.remote_path, self.profile.exclusions, compute_md5=md5
             )
             self.progress.emit(f"Remote: {len(remote)} files.")
             self.finished.emit(local, remote)

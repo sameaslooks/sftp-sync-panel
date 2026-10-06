@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -18,6 +19,7 @@ class FileInfo:
     path: str    # relative to root, forward slashes
     size: int
     mtime: float
+    md5: Optional[str] = field(default=None, compare=False)
 
 
 @dataclass
@@ -57,7 +59,15 @@ def _is_excluded(rel_path: str, exclusions: List[str]) -> bool:
 # ---------------------------------------------------------------------------
 # Local scan
 
-def scan_local(root: str, exclusions: List[str]) -> FileTree:
+def _md5_local(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def scan_local(root: str, exclusions: List[str], compute_md5: bool = False) -> FileTree:
     result: FileTree = {}
     root = os.path.normpath(root)
 
@@ -82,7 +92,8 @@ def scan_local(root: str, exclusions: List[str]) -> FileTree:
             full = os.path.join(dirpath, fname)
             try:
                 st = os.stat(full)
-                result[rel_file] = FileInfo(rel_file, st.st_size, st.st_mtime)
+                md5 = _md5_local(full) if compute_md5 else None
+                result[rel_file] = FileInfo(rel_file, st.st_size, st.st_mtime, md5=md5)
             except OSError:
                 pass
 
@@ -92,7 +103,7 @@ def scan_local(root: str, exclusions: List[str]) -> FileTree:
 # ---------------------------------------------------------------------------
 # Remote scan  (single SSH round-trip via `find`)
 
-def scan_remote(conn, remote_root: str, exclusions: List[str]) -> FileTree:
+def scan_remote(conn, remote_root: str, exclusions: List[str], compute_md5: bool = False) -> FileTree:
     # Enumerate all remote files in one round-trip; exclusions are applied
     # in Python below via _is_excluded().  The old find -prune approach
     # incorrectly dropped *files* (not just dirs) whose names matched any
@@ -114,6 +125,19 @@ def scan_remote(conn, remote_root: str, exclusions: List[str]) -> FileTree:
         if _is_excluded(rel, exclusions):
             continue
         result[rel] = FileInfo(rel, size, mtime)
+
+    if compute_md5 and result:
+        prefix = remote_root.rstrip("/") + "/"
+        md5_cmd = f'find {remote_root} -type f -print0 | xargs -0 md5sum 2>/dev/null'
+        md5_out, _ = conn.exec(md5_cmd)
+        for line in md5_out.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            hash_val, abs_path = parts[0], parts[1].strip()
+            rel = abs_path[len(prefix):] if abs_path.startswith(prefix) else None
+            if rel and rel in result:
+                result[rel].md5 = hash_val
 
     return result
 
@@ -146,7 +170,6 @@ def compute_diff(
 def _changed(lf: FileInfo, rf: FileInfo, mode: str) -> bool:
     if lf.size != rf.size:
         return True
-    if mode == "mtime":
-        return abs(lf.mtime - rf.mtime) > 1.0
-    # md5 mode: caller must resolve, here fall back to mtime
+    if mode == "md5" and lf.md5 is not None and rf.md5 is not None:
+        return lf.md5 != rf.md5
     return abs(lf.mtime - rf.mtime) > 1.0
