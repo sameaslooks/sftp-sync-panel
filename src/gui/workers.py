@@ -102,6 +102,32 @@ class SyncWorker(QThread):
 
 # ---------------------------------------------------------------------------
 
+class LocalScanWorker(QThread):
+    """Rescans only local files; caller reuses the cached remote state."""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(dict)   # local_files
+    failed = pyqtSignal(str)
+
+    def __init__(self, profile) -> None:
+        super().__init__()
+        self.profile = profile
+
+    def run(self) -> None:
+        try:
+            md5 = getattr(self.profile, "compare_mode", "mtime") == "md5"
+            suffix = " (MD5)…" if md5 else "…"
+            self.progress.emit(f"Scanning local files{suffix}")
+            local: Dict[str, FileInfo] = scan_local(
+                self.profile.local_path, self.profile.exclusions, compute_md5=md5
+            )
+            self.progress.emit(f"Local: {len(local)} files.")
+            self.finished.emit(local)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
+
 class DeleteWorker(QThread):
     """Moves a single remote file to server-side trash."""
     log_line = pyqtSignal(str, str)

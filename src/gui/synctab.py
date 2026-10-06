@@ -21,7 +21,7 @@ from engine.watcher import FileWatcher
 from gui.filepanel import FilePanel
 from gui.logpanel import LogPanel
 from gui.notificationstrip import NotificationStrip
-from gui.workers import ConnectWorker, DeleteWorker, ScanWorker, SyncWorker
+from gui.workers import ConnectWorker, DeleteWorker, LocalScanWorker, ScanWorker, SyncWorker
 import gui.theme as theme
 
 
@@ -46,8 +46,11 @@ class SyncTab(QWidget):
 
         self._connect_worker: Optional[ConnectWorker] = None
         self._scan_worker: Optional[ScanWorker] = None
+        self._local_scan_worker: Optional[LocalScanWorker] = None
         self._sync_worker: Optional[SyncWorker] = None
         self._auto_sync_after_scan: bool = False
+        self._last_ops: List[SyncOp] = []
+        self._last_dry_run: bool = False
 
         self._watcher_changed.connect(self._on_file_changed)
         self._watcher_deleted.connect(self._on_file_deleted_locally)
@@ -350,6 +353,8 @@ class SyncTab(QWidget):
             self._run_sync(final_ops, dry_run)
 
     def _run_sync(self, ops: List[SyncOp], dry_run: bool = False) -> None:
+        self._last_ops = ops
+        self._last_dry_run = dry_run
         self._sync_btn.setEnabled(False)
         self._set_status("Syncing…", "#B45309")
         self._sync_worker = SyncWorker(self._conn, self.profile, ops, dry_run)
@@ -366,8 +371,22 @@ class SyncTab(QWidget):
         level = "success" if success else "error"
         self._log(summary, level)
         self._set_status("Connected", "#15803D")
-        # Re-scan to update diff badges
-        self._start_scan()
+        if success and not self._last_dry_run:
+            self._apply_ops_to_remote(self._last_ops)
+        else:
+            self._start_scan()
+
+    def _apply_ops_to_remote(self, ops: List[SyncOp]) -> None:
+        """Update in-memory remote state after sync — avoids full rescan."""
+        import copy
+        for op in ops:
+            if op.op.value in ("add", "update"):
+                lf = self._local_files.get(op.path)
+                if lf:
+                    self._remote_files[op.path] = copy.copy(lf)
+            elif op.op.value == "delete":
+                self._remote_files.pop(op.path, None)
+        self._refresh_panels()
 
     # ── Auto-sync / watcher ───────────────────────────────────────────────
 
@@ -400,11 +419,42 @@ class SyncTab(QWidget):
     def _on_debounce_fire(self) -> None:
         if not self._conn or not self._pending_changes:
             return
+        # Drop if a scan is already in flight to avoid SSH channel overload.
+        if (self._scan_worker and self._scan_worker.isRunning()) or \
+           (self._local_scan_worker and self._local_scan_worker.isRunning()):
+            self._debounce_timer.start(self.profile.auto_sync_interval * 1000)
+            return
         paths = list(self._pending_changes)
         self._pending_changes.clear()
-        self._log(f"Auto-sync: {len(paths)} file(s) changed, rescanning…", "info")
-        self._auto_sync_after_scan = True
-        self._start_scan()
+        self._log(f"Auto-sync: {len(paths)} file(s) changed…", "info")
+        self._start_local_scan()
+
+    def _start_local_scan(self) -> None:
+        """Rescan local only; reuse cached remote — avoids SSH round-trip."""
+        if not self._remote_files:
+            # No remote cache yet — fall back to full scan.
+            self._auto_sync_after_scan = True
+            self._start_scan()
+            return
+        self._local_scan_worker = LocalScanWorker(self.profile)
+        self._local_scan_worker.progress.connect(lambda m: self._log(m))
+        self._local_scan_worker.finished.connect(self._on_local_scan_done)
+        self._local_scan_worker.failed.connect(lambda m: self._log(f"Scan error: {m}", "error"))
+        self._local_scan_worker.start()
+
+    def _on_local_scan_done(self, local: dict) -> None:
+        self._local_files = local
+        self._refresh_panels()
+        ops = compute_diff(
+            local, self._remote_files,
+            mirror_delete=self.profile.mirror_delete,
+            compare_mode=self.profile.compare_mode,
+        )
+        if ops:
+            if self._sync_worker and self._sync_worker.isRunning():
+                return
+            self._log(f"Auto-sync: {len(ops)} op(s)…", "info")
+            self._run_sync(ops)
 
     def _on_delete_requested(self, rel_path: str) -> None:
         if not self._conn:
