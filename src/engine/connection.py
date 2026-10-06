@@ -41,7 +41,10 @@ class SFTPConnection:
                 raise AgentNotAvailableError(
                     "SSH agent has no keys loaded. Run: ssh-add ~/.ssh/id_ed25519"
                 )
-            kwargs["pkey"] = keys[0]
+            # Let paramiko use the agent directly so it tries every loaded
+            # key and performs agent-side signing (pkey= only tries keys[0]
+            # and bypasses the agent signing protocol).
+            kwargs["allow_agent"] = True
 
         elif self.profile.auth == "key_file":
             if not self.profile.key_file:
