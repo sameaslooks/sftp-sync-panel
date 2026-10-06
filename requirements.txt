@@ -1,0 +1,4 @@
+PyQt6>=6.6.0
+paramiko>=3.4.0
+watchdog>=4.0.0
+cryptography>=41.0.0
